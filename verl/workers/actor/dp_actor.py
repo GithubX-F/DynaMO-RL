@@ -351,25 +351,23 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys
 
     def _compute_entropy_estimation(self, entropy, log_prob, advantages, old_log_prob, response_mask, clip_ratio_low, clip_ratio_high):
-        eta = 1e-6
-        r_it = torch.exp(log_prob.detach() - old_log_prob.detach())
-        clip_indicator = ((advantages.detach() > 0).float() * (r_it <= 1.0 + clip_ratio_high).float() + (advantages.detach() < 0).float() * (r_it >= 1.0 - clip_ratio_low).float())
-        pi_theta = torch.exp(log_prob.detach())
-        entropy_change = torch.sum(-eta * pi_theta * (log_prob.detach() + entropy.detach()) * pi_theta * clip_indicator * r_it * advantages.detach() * response_mask, dim=-1, keepdim=True).expand_as(entropy)
-        result = torch.abs(entropy_change)
-        print(f"entropy_est_debug: r_it={r_it.mean():.6f}, clip_ind={clip_indicator.mean():.6f}, entropy_change={entropy_change.mean():.6f}, result={result.mean():.6f}")
-        return result
-
-    def _compute_entropy__estimation(self, entropy, log_prob, advantages, old_log_prob, response_mask, clip_ratio_low, clip_ratio_high):
-        eta = 1e-6
-        r_it = torch.exp(log_prob.detach() - old_log_prob.detach())
-        clip_indicator = ((advantages.detach() > 0).float() * (r_it <= 1.0 + clip_ratio_high).float() + (advantages.detach() < 0).float() * (r_it >= 1.0 - clip_ratio_low).float())
-        pi_theta = torch.exp(log_prob.detach())
-        lambda_theta = log_prob.detach() + entropy.detach()
-        xi_it = clip_indicator * r_it * advantages.detach()
-        entropy_change = -eta * (pi_theta ** 2) * lambda_theta * xi_it
-        result = torch.abs(entropy_change)
-        print(f"entropy_est_debug: r_it={r_it.mean():.6f}, clip_ind={clip_indicator.mean():.6f}, entropy_change={entropy_change.mean():.6f}, result={result.mean():.6f}, result_std={result.std():.6f}")
+        # DynaMO Eq.29: ΔH_{i,t} = -ξ_{i,t} · [π·Λ - E[π·Λ]], token粒度, shape=(bsz, seq_len)
+        # ξ = I_clip · r_{i,t} · A_{i,t}, Λ = log π + H
+        # E[π·Λ] 用序列内有效token均值近似（无完整词表分布）
+        with torch.no_grad():
+            r_it = torch.exp(log_prob - old_log_prob)
+            clip_indicator = (
+                (advantages > 0).float() * (r_it <= 1.0 + clip_ratio_high).float()
+                + (advantages < 0).float() * (r_it >= 1.0 - clip_ratio_low).float()
+            )
+            xi = clip_indicator * r_it * advantages
+            pi_theta = torch.exp(log_prob)
+            term1 = pi_theta * (log_prob + entropy)
+            mask_float = response_mask.float()
+            E_pi_Lambda = (term1 * mask_float).sum(dim=-1, keepdim=True) / mask_float.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            delta_H = -xi * (term1 - E_pi_Lambda)
+            result = torch.abs(delta_H) * mask_float
+            print(f"entropy_est_debug: xi={xi.mean():.4f}, delta_H={delta_H[mask_float > 0].mean():.4f}, result={result[mask_float > 0].mean():.4f}")
         return result
     
     def _get_adjusted_clip_ratio_low(self, base_ratio: float) -> float:
@@ -465,47 +463,44 @@ class DataParallelPPOActor(BasePPOActor):
                         print("=====", entropy_mode)
                         if entropy is not None:
                             if entropy_mode == "decay6_linearnorm":
+                                mask_float = response_mask.float()
                                 entropy_est = self._compute_entropy_estimation(
-                                    entropy, log_prob, advantages, old_log_prob, 
+                                    entropy, log_prob, advantages, old_log_prob,
                                     response_mask, clip_ratio_low, clip_ratio_high
                                 )
                                 lambda_min = self.config.get('lambda_min', 0.6)
-                                x = entropy_est / (torch.max(entropy_est) + 1e-8)
+                                x = entropy_est / (entropy_est.max() + 1e-8)
                                 decay_factor = (lambda_min + (1 - lambda_min) / (1 + torch.exp(50 * (x - 0.99)))).detach()
-                                
+
                                 mu_max = self.config.get('mu_max', 1.2)
-                                is_positive_adv = advantages > 0
                                 entropy_detached = entropy.detach()
-                                entropy_min = torch.min(entropy_detached)
-                                entropy_max = torch.max(entropy_detached)
+                                entropy_min = (entropy_detached * mask_float + (1 - mask_float) * entropy_detached.max()).min()
+                                entropy_max = (entropy_detached * mask_float + (1 - mask_float) * entropy_detached.min()).max()
                                 entropy_norm = (entropy_max - entropy_detached) / (entropy_max - entropy_min + 1e-8)
                                 boost_factor = 1.0 + (mu_max - 1.0) * entropy_norm
-                                boost_factor = torch.where(is_positive_adv, boost_factor, 1.0)
-                                
-                                combined_factor = (decay_factor * boost_factor).detach()
-                                advantages = advantages * combined_factor
+                                boost_factor = torch.where(advantages > 0, boost_factor, torch.ones_like(boost_factor))
+                                advantages = advantages * (decay_factor * boost_factor).detach()
                             elif entropy_mode == "decay5_linearnorm":
+                                mask_float = response_mask.float()
                                 alpha = self.config.get('alpha', 0.4)
                                 gamma = self.config.get('gamma', 50)
                                 tau = self.config.get('tau', 0.9)
                                 entropy_est = self._compute_entropy_estimation(
-                                    entropy, log_prob, advantages, old_log_prob, 
+                                    entropy, log_prob, advantages, old_log_prob,
                                     response_mask, clip_ratio_low, clip_ratio_high
                                 )
                                 lambda_min = 1.0 - alpha
-                                x = entropy_est / (torch.max(entropy_est) + 1e-8)
+                                x = entropy_est / (entropy_est.max() + 1e-8)
                                 decay_factor = (lambda_min + (1 - lambda_min) / (1 + torch.exp(gamma * (x - tau)))).detach()
-                                
+
                                 mu_max = 1.0 + alpha
-                                is_positive_adv = advantages > 0
                                 entropy_detached = entropy.detach()
-                                entropy_min = torch.min(entropy_detached)
-                                entropy_max = torch.max(entropy_detached)
+                                entropy_min = (entropy_detached * mask_float + (1 - mask_float) * entropy_detached.max()).min()
+                                entropy_max = (entropy_detached * mask_float + (1 - mask_float) * entropy_detached.min()).max()
                                 entropy_norm = (entropy_max - entropy_detached) / (entropy_max - entropy_min + 1e-8)
                                 boost_factor = 1.0 + (mu_max - 1.0) * entropy_norm
-                                boost_factor = torch.where(is_positive_adv, boost_factor, 1.0)
-                                combined_factor = (decay_factor * boost_factor).detach()
-                                advantages = advantages * combined_factor
+                                boost_factor = torch.where(advantages > 0, boost_factor, torch.ones_like(boost_factor))
+                                advantages = advantages * (decay_factor * boost_factor).detach()
 
                             else:
                                 raise ValueError(f"Unknown entropy_advantage_mode: {entropy_mode}")
